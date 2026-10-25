@@ -1,0 +1,225 @@
+// Slice 1 schema: tenancy, jobs and Hiring Profiles, applications, consent, evidence, decisions, agent runs, audit.
+// Assessments, scores, integrity flags, messages and outcomes arrive with later slices via migrations.
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("MIGRATION_DATABASE_URL")
+}
+
+enum TenantType { EMPLOYER AGENCY }
+enum MemberRole { AGENCY_ADMIN EMPLOYER_ADMIN RECRUITER HIRING_MANAGER }
+enum JobStatus { DRAFT OPEN CLOSED ARCHIVED }
+enum ProfileStatus { DRAFT APPROVED SUPERSEDED }
+enum ApplicationStatus { APPLIED SCREENING ASSESSMENT SHORTLISTED INTERVIEW OFFER HIRED REJECTED WITHDRAWN }
+enum EvidenceStatus { VERIFIED SUPPORTED INFERRED UNKNOWN CONTRADICTORY }
+enum DecisionType { ADVANCE REJECT HOLD OVERRIDE }
+enum AgentRunStatus { SUCCEEDED REJECTED FAILED }
+
+// An agency owns client tenants through parentId. Each client's data lives under the client's own tenant id.
+model Tenant {
+  id        String     @id @default(uuid()) @db.Uuid
+  name      String
+  type      TenantType
+  parentId  String?    @map("parent_id") @db.Uuid
+  parent    Tenant?    @relation("TenantTree", fields: [parentId], references: [id])
+  children  Tenant[]   @relation("TenantTree")
+  createdAt DateTime   @default(now()) @map("created_at")
+  members   Membership[]
+  @@map("tenants")
+}
+
+// Global table, not tenant-scoped: the auth module reads it before a tenant is chosen.
+model User {
+  id           String   @id @default(uuid()) @db.Uuid
+  email        String   @unique
+  name         String
+  passwordHash String   @map("password_hash")
+  createdAt    DateTime @default(now()) @map("created_at")
+  memberships  Membership[]
+  sessions     Session[]
+  @@map("users")
+}
+
+model Membership {
+  id       String     @id @default(uuid()) @db.Uuid
+  userId   String     @map("user_id") @db.Uuid
+  tenantId String     @map("tenant_id") @db.Uuid
+  role     MemberRole
+  user     User       @relation(fields: [userId], references: [id])
+  tenant   Tenant     @relation(fields: [tenantId], references: [id])
+  @@unique([userId, tenantId])
+  @@map("memberships")
+}
+
+model Job {
+  id          String   @id @default(uuid()) @db.Uuid
+  tenantId    String   @map("tenant_id") @db.Uuid
+  title       String
+  status      JobStatus @default(DRAFT)
+  createdById String   @map("created_by_id") @db.Uuid
+  createdAt   DateTime @default(now()) @map("created_at")
+  profiles    HiringProfile[]
+  applications Application[]
+  @@index([tenantId])
+  @@map("jobs")
+}
+
+// Versions are immutable once used for scoring. Criteria and weights live in the criteria JSON.
+model HiringProfile {
+  id           String        @id @default(uuid()) @db.Uuid
+  tenantId     String        @map("tenant_id") @db.Uuid
+  jobId        String        @map("job_id") @db.Uuid
+  version      Int
+  status       ProfileStatus @default(DRAFT)
+  criteria     Json
+  approvedById String?       @map("approved_by_id") @db.Uuid
+  approvedAt   DateTime?     @map("approved_at")
+  createdAt    DateTime      @default(now()) @map("created_at")
+  job          Job           @relation(fields: [jobId], references: [id])
+  applications Application[]
+  @@unique([jobId, version])
+  @@index([tenantId])
+  @@map("hiring_profiles")
+}
+
+model Applicant {
+  id        String   @id @default(uuid()) @db.Uuid
+  tenantId  String   @map("tenant_id") @db.Uuid
+  fullName  String   @map("full_name")
+  email     String?
+  phone     String?
+  createdAt DateTime @default(now()) @map("created_at")
+  applications Application[]
+  consents  ConsentRecord[]
+  @@index([tenantId])
+  @@map("applicants")
+}
+
+model Application {
+  id         String            @id @default(uuid()) @db.Uuid
+  tenantId   String            @map("tenant_id") @db.Uuid
+  jobId      String            @map("job_id") @db.Uuid
+  applicantId String           @map("applicant_id") @db.Uuid
+  profileId  String            @map("profile_id") @db.Uuid
+  status     ApplicationStatus @default(APPLIED)
+  cvText     String?           @map("cv_text")
+  answers    Json              @default("[]")
+  createdAt  DateTime          @default(now()) @map("created_at")
+  job        Job               @relation(fields: [jobId], references: [id])
+  applicant  Applicant         @relation(fields: [applicantId], references: [id])
+  profile    HiringProfile     @relation(fields: [profileId], references: [id])
+  documents  Document[]
+  evidence   EvidenceItem[]
+  decisions  Decision[]
+  @@unique([jobId, applicantId])
+  @@index([tenantId])
+  @@map("applications")
+}
+
+model ConsentRecord {
+  id            String    @id @default(uuid()) @db.Uuid
+  tenantId      String    @map("tenant_id") @db.Uuid
+  applicantId   String    @map("applicant_id") @db.Uuid
+  purpose       String
+  noticeVersion String    @map("notice_version")
+  noticeHash    String    @map("notice_hash")
+  grantedAt     DateTime  @map("granted_at")
+  withdrawnAt   DateTime? @map("withdrawn_at")
+  applicant     Applicant @relation(fields: [applicantId], references: [id])
+  @@index([tenantId])
+  @@map("consent_records")
+}
+
+model Document {
+  id            String   @id @default(uuid()) @db.Uuid
+  tenantId      String   @map("tenant_id") @db.Uuid
+  applicationId String   @map("application_id") @db.Uuid
+  kind          String
+  storageKey    String   @map("storage_key")
+  mimeType      String   @map("mime_type")
+  sizeBytes     Int      @map("size_bytes")
+  sha256        String
+  createdAt     DateTime @default(now()) @map("created_at")
+  application   Application @relation(fields: [applicationId], references: [id])
+  @@index([tenantId])
+  @@map("documents")
+}
+
+// Every claim carries its source excerpt unless its status is UNKNOWN (enforced by a CHECK in rls.sql).
+model EvidenceItem {
+  id               String         @id @default(uuid()) @db.Uuid
+  tenantId         String         @map("tenant_id") @db.Uuid
+  applicationId    String         @map("application_id") @db.Uuid
+  claim            String
+  status           EvidenceStatus
+  sourceDocumentId String?        @map("source_document_id") @db.Uuid
+  sourceExcerpt    String         @default("") @map("source_excerpt")
+  agentRunId       String         @map("agent_run_id") @db.Uuid
+  createdAt        DateTime       @default(now()) @map("created_at")
+  application      Application    @relation(fields: [applicationId], references: [id])
+  @@index([tenantId])
+  @@index([applicationId])
+  @@map("evidence_items")
+}
+
+// Only a human user can write a decision: decidedById is required.
+model Decision {
+  id            String       @id @default(uuid()) @db.Uuid
+  tenantId      String       @map("tenant_id") @db.Uuid
+  applicationId String       @map("application_id") @db.Uuid
+  decidedById   String       @map("decided_by_id") @db.Uuid
+  type          DecisionType
+  reason        String
+  createdAt     DateTime     @default(now()) @map("created_at")
+  application   Application  @relation(fields: [applicationId], references: [id])
+  @@index([tenantId])
+  @@map("decisions")
+}
+
+model AgentRun {
+  id            String         @id @default(uuid()) @db.Uuid
+  tenantId      String         @map("tenant_id") @db.Uuid
+  applicationId String?        @map("application_id") @db.Uuid
+  agent         String
+  modelId       String         @map("model_id")
+  promptVersion String         @map("prompt_version")
+  inputHash     String         @map("input_hash")
+  output        Json?
+  status        AgentRunStatus
+  error         String?
+  createdAt     DateTime       @default(now()) @map("created_at")
+  @@index([tenantId])
+  @@map("agent_runs")
+}
+
+model AuditLog {
+  id         String   @id @default(uuid()) @db.Uuid
+  tenantId   String   @map("tenant_id") @db.Uuid
+  actorType  String   @map("actor_type")
+  actorId    String?  @map("actor_id") @db.Uuid
+  action     String
+  entityType String   @map("entity_type")
+  entityId   String   @map("entity_id")
+  meta       Json     @default("{}")
+  createdAt  DateTime @default(now()) @map("created_at")
+  @@index([tenantId, createdAt])
+  @@map("audit_logs")
+}
+
+// Global table like users. Only the SHA-256 hash of the session token is stored.
+model Session {
+  id             String    @id @default(uuid()) @db.Uuid
+  userId         String    @map("user_id") @db.Uuid
+  tokenHash      String    @unique @map("token_hash")
+  activeTenantId String?   @map("active_tenant_id") @db.Uuid
+  expiresAt      DateTime  @map("expires_at")
+  revokedAt      DateTime? @map("revoked_at")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  user           User      @relation(fields: [userId], references: [id])
+  @@index([userId])
+  @@map("sessions")
+}
